@@ -40,16 +40,8 @@ CREATE TABLE IF NOT EXISTS documents (
 
 CREATE VIRTUAL TABLE IF NOT EXISTS documents_fts USING fts5(
     filename, content,
-    content='documents',
     tokenize='unicode61'
 );
-
-CREATE TRIGGER IF NOT EXISTS documents_ai AFTER INSERT ON documents BEGIN
-  INSERT INTO documents_fts(rowid, filename, content) VALUES (new.id, new.filename, '');
-END;
-CREATE TRIGGER IF NOT EXISTS documents_ad AFTER DELETE ON documents BEGIN
-  INSERT INTO documents_fts(documents_fts, rowid, filename, content) VALUES('delete', old.id, old.filename, '');
-END;
 """
 
 

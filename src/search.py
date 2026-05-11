@@ -14,31 +14,68 @@ import sqlite3
 import sys
 from pathlib import Path
 
+# Some PDF extracts contain unicode chars Windows cp1252 console can't render.
+# Reconfigure stdout to UTF-8 with replacement so we never crash on display.
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+except (AttributeError, OSError):
+    pass
+
+
+def normalize_query(q: str) -> str:
+    """Auto-quote whitespace-separated tokens containing '-' so FTS5 doesn't
+    interpret the hyphen as a NOT operator. Tokens already quoted are kept."""
+    out: list[str] = []
+    in_quote = False
+    buf = ""
+    for ch in q:
+        if ch == '"':
+            in_quote = not in_quote
+            buf += ch
+        elif ch.isspace() and not in_quote:
+            if buf:
+                out.append(buf)
+                buf = ""
+        else:
+            buf += ch
+    if buf:
+        out.append(buf)
+    return " ".join(
+        f'"{tok}"' if "-" in tok and not (tok.startswith('"') and tok.endswith('"')) else tok
+        for tok in out
+    )
+
 
 def fts_query(conn: sqlite3.Connection, query: str | None, filename: str | None,
-              ext: str | None, limit: int) -> list[tuple[str, str, float, str]]:
-    """Returns [(path, filename, rank, snippet), ...]."""
-    sql = """
-        SELECT d.path, d.filename, documents_fts.rank,
-               snippet(documents_fts, 1, '[', ']', ' ... ', 16) AS snip
-        FROM documents_fts
-        JOIN documents d ON d.id = documents_fts.rowid
-        WHERE 1=1
-    """
+              ext: str | None, limit: int) -> list[tuple[str, str, str]]:
+    """Returns [(path, filename, snippet), ...]."""
     params: list = []
     if query:
-        sql += " AND documents_fts MATCH ?"
+        query = normalize_query(query)
+        sql = """
+            SELECT d.path, d.filename,
+                   snippet(documents_fts, 1, '[', ']', ' ... ', 16) AS snip
+            FROM documents_fts
+            JOIN documents d ON d.id = documents_fts.rowid
+            WHERE documents_fts MATCH ?
+        """
         params.append(query)
-    if filename:
-        sql += " AND d.filename LIKE ?"
-        params.append(f"%{filename}%")
-    if ext:
-        sql += " AND d.ext = ?"
-        params.append(ext if ext.startswith(".") else f".{ext}")
-    if query:
-        sql += " ORDER BY documents_fts.rank LIMIT ?"
+        if filename:
+            sql += " AND d.filename LIKE ?"
+            params.append(f"%{filename}%")
+        if ext:
+            sql += " AND d.ext = ?"
+            params.append(ext if ext.startswith(".") else f".{ext}")
+        sql += " ORDER BY bm25(documents_fts) LIMIT ?"
     else:
-        sql += " ORDER BY d.path LIMIT ?"
+        sql = "SELECT path, filename, '' AS snip FROM documents WHERE 1=1"
+        if filename:
+            sql += " AND filename LIKE ?"
+            params.append(f"%{filename}%")
+        if ext:
+            sql += " AND ext = ?"
+            params.append(ext if ext.startswith(".") else f".{ext}")
+        sql += " ORDER BY path LIMIT ?"
     params.append(limit)
     return conn.execute(sql, params).fetchall()
 
@@ -66,11 +103,10 @@ def main() -> None:
         print("No matches.")
         return
 
-    for path, filename, rank, snippet in results:
+    for path, filename, snippet in results:
         print(f"\n{filename}")
         print(f"  {path}")
         if snippet and args.query:
-            # Snippet has [...] around matches; clean for terminal display.
             cleaned = snippet.replace("\r", " ").replace("\n", " ").strip()
             if len(cleaned) > 280:
                 cleaned = cleaned[:280] + "..."
