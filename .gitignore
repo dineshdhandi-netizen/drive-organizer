@@ -21,3 +21,5 @@ desktop.ini
 # Generated reports (may contain personal filenames)
 reports/*.csv
 reports/*.log
+reports/*.db
+reports/*.sqlite
