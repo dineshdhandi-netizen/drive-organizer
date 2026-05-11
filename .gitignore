@@ -18,6 +18,11 @@ env/
 Thumbs.db
 desktop.ini
 
+# Credentials (NEVER commit these)
+credentials.json
+token.json
+.env
+
 # Generated reports (may contain personal filenames)
 reports/*.csv
 reports/*.log
