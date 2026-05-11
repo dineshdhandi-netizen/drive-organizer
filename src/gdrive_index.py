@@ -35,15 +35,15 @@ from pathlib import Path
 
 SCOPES = ["https://www.googleapis.com/auth/drive.readonly"]
 
-GOOGLE_NATIVE_EXTS = {".gdoc", ".gdocument", ".gsheet", ".gslides", ".gdraw"}
-
-# How to ask Drive to convert each native type to text we can index.
-EXPORT_MIME: dict[str, str] = {
-    ".gdoc":      "text/plain",
-    ".gdocument": "text/plain",
-    ".gsheet":    "text/csv",     # CSV is a clean text format for spreadsheets
-    ".gslides":   "text/plain",
-    ".gdraw":     "image/svg+xml",  # drawings — text-bearing if any
+# In streaming-mode Drive, .gdoc/.gsheet/.gslides pointer files cannot be
+# opened via the normal Windows file API (OSError: Invalid argument). The
+# robust path is to ask the Drive API itself for the list of Google-native
+# files by MIME type, then export each one as text.
+NATIVE_MIME_TO_EXPORT: dict[str, tuple[str, str]] = {
+    # native MIME                                         export MIME    synthetic ext
+    "application/vnd.google-apps.document":              ("text/plain", ".gdoc"),
+    "application/vnd.google-apps.spreadsheet":           ("text/csv",   ".gsheet"),
+    "application/vnd.google-apps.presentation":          ("text/plain", ".gslides"),
 }
 
 
@@ -82,12 +82,29 @@ def build_service(creds):
     return build("drive", "v3", credentials=creds, cache_discovery=False)
 
 
-def read_doc_id(pointer_path: Path) -> str | None:
-    try:
-        data = json.loads(pointer_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return None
-    return data.get("doc_id") or data.get("resource_id", "").split(":")[-1] or None
+def list_native_files(service):
+    """Yield Google-native files via the Drive API (by MIME type)."""
+    from googleapiclient.errors import HttpError
+    q = " or ".join(f"mimeType='{m}'" for m in NATIVE_MIME_TO_EXPORT)
+    q = f"({q}) and trashed = false"
+    page_token = None
+    while True:
+        try:
+            result = service.files().list(
+                q=q,
+                pageSize=200,
+                fields="nextPageToken, files(id, name, mimeType, modifiedTime, webViewLink)",
+                pageToken=page_token,
+                supportsAllDrives=False,
+            ).execute()
+        except HttpError as e:
+            print(f"API error listing files: {e}", file=sys.stderr)
+            return
+        for f in result.get("files", []):
+            yield f
+        page_token = result.get("nextPageToken")
+        if not page_token:
+            break
 
 
 def export_text(service, doc_id: str, mime: str) -> str:
@@ -119,15 +136,24 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
     """)
 
 
-def upsert(conn: sqlite3.Connection, path: Path, text: str) -> str:
+def upsert_native(conn: sqlite3.Connection, file_info: dict, text: str) -> str:
+    """Upsert a Google-native file. We use webViewLink (the docs.google.com URL)
+    as 'path' so search results give a clickable link."""
+    from datetime import datetime
+    path = file_info.get("webViewLink") or f"drive://{file_info['id']}"
+    name = file_info["name"]
+    ext = NATIVE_MIME_TO_EXPORT[file_info["mimeType"]][1]
+    size = len(text.encode("utf-8"))
+    modified = file_info.get("modifiedTime", "")
     try:
-        st = path.stat()
-    except OSError:
-        return "error"
+        mtime = datetime.fromisoformat(modified.replace("Z", "+00:00")).timestamp()
+    except (ValueError, AttributeError):
+        mtime = time.time()
+
     existing = conn.execute(
-        "SELECT id, size, mtime FROM documents WHERE path = ?", (str(path),)
+        "SELECT id, mtime FROM documents WHERE path = ?", (path,)
     ).fetchone()
-    if existing and existing[1] == st.st_size and existing[2] == st.st_mtime:
+    if existing and abs(existing[1] - mtime) < 1.0:
         return "skipped"
     if existing:
         conn.execute("DELETE FROM documents WHERE id = ?", (existing[0],))
@@ -135,27 +161,26 @@ def upsert(conn: sqlite3.Connection, path: Path, text: str) -> str:
     conn.execute(
         """INSERT INTO documents (path, filename, ext, size, mtime, indexed_at)
            VALUES (?, ?, ?, ?, ?, ?)""",
-        (str(path), path.name, path.suffix.lower(), st.st_size, st.st_mtime, time.time()),
+        (path, name, ext, size, mtime, time.time()),
     )
     row_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
     conn.execute(
         "INSERT INTO documents_fts(rowid, filename, content) VALUES (?, ?, ?)",
-        (row_id, path.name, text or ""),
+        (row_id, name, text or ""),
     )
     return "inserted"
 
 
 def main() -> None:
     p = argparse.ArgumentParser(description="Index Google-native file content via Drive API.")
-    p.add_argument("target", type=Path, help="Drive root (e.g. G:\\My Drive)")
+    # 'target' kept for backwards-compat with the old CLI invocation but unused.
+    p.add_argument("target", type=Path, nargs="?", default=None,
+                   help="(Ignored — files come from the Drive API, not local walk.)")
     p.add_argument("--db", type=Path, default=Path("reports/search.db"))
     p.add_argument("--credentials", type=Path, default=Path("credentials.json"))
     p.add_argument("--token", type=Path, default=Path("token.json"))
     p.add_argument("--limit", type=int, default=None, help="Process at most N files (testing).")
     args = p.parse_args()
-
-    if not args.target.is_dir():
-        sys.exit(f"Not a directory: {args.target}")
 
     creds = load_credentials(args.credentials, args.token)
     service = build_service(creds)
@@ -167,24 +192,16 @@ def main() -> None:
     inserted = skipped = errored = 0
     n = 0
     t0 = time.time()
-    print(f"Looking for Google-native files under {args.target} ...")
-    for path in args.target.rglob("*"):
-        if not path.is_file():
-            continue
-        if path.suffix.lower() not in GOOGLE_NATIVE_EXTS:
-            continue
+    print("Listing Google-native files via Drive API ...")
+    for file_info in list_native_files(service):
         n += 1
-        doc_id = read_doc_id(path)
-        if not doc_id:
-            errored += 1
-            continue
-        mime = EXPORT_MIME.get(path.suffix.lower(), "text/plain")
-        text = export_text(service, doc_id, mime)
+        export_mime = NATIVE_MIME_TO_EXPORT[file_info["mimeType"]][0]
+        text = export_text(service, file_info["id"], export_mime)
         if text.startswith("__ERROR__"):
             errored += 1
-            print(f"  error: {path.name}  {text}", file=sys.stderr)
+            print(f"  error: {file_info['name']}  {text}", file=sys.stderr)
             continue
-        result = upsert(conn, path, text)
+        result = upsert_native(conn, file_info, text)
         if result == "inserted":
             inserted += 1
         elif result == "skipped":
