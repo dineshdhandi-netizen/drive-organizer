@@ -28,6 +28,7 @@ from __future__ import annotations
 import argparse
 import concurrent.futures
 import io
+import json
 import os
 import sqlite3
 import sys
@@ -125,6 +126,37 @@ def list_images_recursive(service, folder_id: str):
         page_token = result.get("nextPageToken")
         if not page_token:
             break
+
+
+def list_images_cached(service, folder_id: str, cache_path: Path, refresh: bool) -> list[dict]:
+    """List images once, then reuse a JSONL cache on subsequent runs.
+
+    Drive's recursive listing can be very slow in Cloud Shell (and may hang on
+    flaky connections). Caching the result means later runs (retries, full
+    runs after a test) skip the listing entirely.
+    """
+    if not refresh and cache_path.exists():
+        print(f"Loading photo list from cache: {cache_path}")
+        with cache_path.open(encoding="utf-8") as f:
+            files = [json.loads(line) for line in f if line.strip()]
+        print(f"  {len(files)} files in cache (pass --refresh-list to re-fetch)")
+        return files
+
+    print("Listing image files via Drive API (this can take a minute) ...")
+    files: list[dict] = []
+    t0 = time.time()
+    for f in list_images_recursive(service, folder_id):
+        files.append(f)
+        if len(files) % 1000 == 0:
+            print(f"  listed {len(files)} so far ({time.time() - t0:.1f}s) ...")
+    print(f"  listed {len(files)} files total in {time.time() - t0:.1f}s")
+
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    with cache_path.open("w", encoding="utf-8") as f:
+        for fi in files:
+            f.write(json.dumps(fi) + "\n")
+    print(f"  cached to {cache_path}")
+    return files
 
 
 def download_image(service, file_id: str, max_retries: int = 3) -> bytes | None:
@@ -284,6 +316,10 @@ def main() -> None:
     p.add_argument("--force", action="store_true", help="Re-tag photos already in DB.")
     p.add_argument("--dry-run", action="store_true",
                    help="Print cost + photo count, no API calls.")
+    p.add_argument("--list-cache", type=Path, default=Path("reports/photo_list.jsonl"),
+                   help="Cache file for the Drive image list (avoids re-listing).")
+    p.add_argument("--refresh-list", action="store_true",
+                   help="Re-fetch the photo list from Drive (ignore cache).")
     args = p.parse_args()
 
     project_id = (
@@ -317,10 +353,12 @@ def main() -> None:
     print(f"Location: {args.location}")
     print(f"Model:    {args.model}")
     print(f"Workers:  {args.workers}")
-    print("\nListing image files (this can take a minute) ...")
+    print()
 
-    all_files = list(list_images_recursive(drive_service, folder_id))
-    print(f"Found {len(all_files)} image files.")
+    all_files = list_images_cached(
+        drive_service, folder_id, args.list_cache, args.refresh_list
+    )
+    print(f"Total images: {len(all_files)}")
 
     args.db.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(args.db), check_same_thread=False)

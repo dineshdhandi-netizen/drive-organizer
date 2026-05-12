@@ -28,3 +28,4 @@ reports/*.csv
 reports/*.log
 reports/*.db
 reports/*.sqlite
+reports/*.jsonl
