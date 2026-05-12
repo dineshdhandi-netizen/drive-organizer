@@ -40,10 +40,11 @@ from pathlib import Path
 
 SCOPES = ["https://www.googleapis.com/auth/drive.readonly"]
 RESIZE_LONG_EDGE = 1024
-# 10 concurrent workers caused SSL/DNS flakiness in Cloud Shell. 5 is safer.
+# vertexai's gRPC crashed with thread concurrency; google-genai uses REST.
+# 5 workers is fine on REST.
 DEFAULT_WORKERS = 5
-# Versioned model IDs are required on Vertex AI; the unversioned alias 404s.
-DEFAULT_MODEL = "gemini-2.0-flash-001"
+# google-genai accepts unversioned aliases; 2.5-flash is current.
+DEFAULT_MODEL = "gemini-2.5-flash"
 DEFAULT_LOCATION = "us-central1"
 
 SYSTEM_PROMPT = (
@@ -201,36 +202,41 @@ def resize_to_jpeg_bytes(raw: bytes) -> bytes | None:
         return None
 
 
-# ---------- Vertex AI / Gemini ----------
+# ---------- Vertex AI / Gemini (google-genai REST SDK) ----------
 
 def init_gemini(project_id: str, location: str, model_name: str):
+    """Returns a (client, model_name) tuple. Uses google-genai (REST), not
+    vertexai (gRPC) — the latter crashes with heap corruption under thread
+    concurrency in Cloud Shell."""
     try:
-        import vertexai
-        from vertexai.generative_models import GenerativeModel
+        from google import genai
     except ImportError:
         sys.exit(
-            "Missing google-cloud-aiplatform. In Cloud Shell run:\n"
-            "  pip install google-cloud-aiplatform"
+            "Missing google-genai. In Cloud Shell run:\n"
+            "  pip install google-genai"
         )
-    vertexai.init(project=project_id, location=location)
-    return GenerativeModel(model_name, system_instruction=SYSTEM_PROMPT)
+    client = genai.Client(vertexai=True, project=project_id, location=location)
+    return client, model_name
 
 
-def describe_image(model, image_bytes: bytes, max_retries: int = 3) -> str | None:
-    from vertexai.generative_models import Part
+def describe_image(client_and_model, image_bytes: bytes, max_retries: int = 3) -> str | None:
+    from google.genai import types
+    client, model_name = client_and_model
     delay = 1.0
     last_err: Exception | None = None
-    for attempt in range(max_retries):
+    for _ in range(max_retries):
         try:
-            response = model.generate_content(
-                [
-                    Part.from_data(data=image_bytes, mime_type="image/jpeg"),
+            response = client.models.generate_content(
+                model=model_name,
+                contents=[
+                    types.Part.from_bytes(data=image_bytes, mime_type="image/jpeg"),
                     "Describe this photo.",
                 ],
-                generation_config={
-                    "max_output_tokens": 100,
-                    "temperature": 0.3,
-                },
+                config=types.GenerateContentConfig(
+                    system_instruction=SYSTEM_PROMPT,
+                    max_output_tokens=100,
+                    temperature=0.3,
+                ),
             )
             text = (response.text or "").strip()
             return text or None

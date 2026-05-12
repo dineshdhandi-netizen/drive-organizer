@@ -13,4 +13,6 @@ google-auth-httplib2>=0.2
 anthropic>=0.40
 
 # Optional: only needed for gemini_photo_tagger.py (Vertex AI on GCP)
-google-cloud-aiplatform>=1.60
+# Use google-genai (REST) instead of google-cloud-aiplatform (gRPC); the
+# latter crashed with heap corruption under thread concurrency in Cloud Shell.
+google-genai>=0.3
