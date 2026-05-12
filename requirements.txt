@@ -9,5 +9,8 @@ google-api-python-client>=2.0
 google-auth-oauthlib>=1.0
 google-auth-httplib2>=0.2
 
-# Optional: only needed for photo_tagger.py
+# Optional: only needed for photo_tagger.py (Anthropic)
 anthropic>=0.40
+
+# Optional: only needed for gemini_photo_tagger.py (Vertex AI on GCP)
+google-cloud-aiplatform>=1.60
