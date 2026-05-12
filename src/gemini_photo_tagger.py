@@ -39,8 +39,10 @@ from pathlib import Path
 
 SCOPES = ["https://www.googleapis.com/auth/drive.readonly"]
 RESIZE_LONG_EDGE = 1024
-DEFAULT_WORKERS = 10
-DEFAULT_MODEL = "gemini-2.0-flash"
+# 10 concurrent workers caused SSL/DNS flakiness in Cloud Shell. 5 is safer.
+DEFAULT_WORKERS = 5
+# Versioned model IDs are required on Vertex AI; the unversioned alias 404s.
+DEFAULT_MODEL = "gemini-2.0-flash-001"
 DEFAULT_LOCATION = "us-central1"
 
 SYSTEM_PROMPT = (
@@ -125,13 +127,24 @@ def list_images_recursive(service, folder_id: str):
             break
 
 
-def download_image(service, file_id: str) -> bytes | None:
+def download_image(service, file_id: str, max_retries: int = 3) -> bytes | None:
     from googleapiclient.errors import HttpError
-    try:
-        return service.files().get_media(fileId=file_id).execute()
-    except HttpError as e:
-        print(f"  download error for {file_id}: {e}", file=sys.stderr)
-        return None
+    delay = 1.0
+    last_err: Exception | None = None
+    for attempt in range(max_retries):
+        try:
+            return service.files().get_media(fileId=file_id).execute()
+        except HttpError as e:
+            last_err = e
+            time.sleep(delay)
+            delay *= 2
+        except Exception as e:
+            # SSL/DNS errors, connection resets — retry with backoff
+            last_err = e
+            time.sleep(delay)
+            delay *= 2
+    print(f"  download error for {file_id} after retries: {last_err}", file=sys.stderr)
+    return None
 
 
 def resize_to_jpeg_bytes(raw: bytes) -> bytes | None:
